@@ -17,6 +17,7 @@ import {
   NETWORK_PASSPHRASES,
   StellarNetwork,
 } from '../config/stellar-networks';
+import { mapSorobanErrorToApiException } from './soroban-errors';
 
 export interface OnChainTicket {
   eventId: bigint;
@@ -84,6 +85,7 @@ export class StellarService {
   private readonly logger = new Logger(StellarService.name);
   private readonly server: rpc.Server;
   private readonly contract: Contract;
+  private readonly contractId: string;
   private readonly networkPassphrase: string;
   private readonly platformSigner: Keypair;
   private readonly buildTxTimeoutSeconds: number;
@@ -100,9 +102,8 @@ export class StellarService {
     this.server = new rpc.Server(rpcUrl, {
       allowHttp: rpcUrl.startsWith('http://'),
     });
-    this.contract = new Contract(
-      this.config.getOrThrow<string>('TICKETING_CONTRACT_ID'),
-    );
+    this.contractId = this.config.getOrThrow<string>('TICKETING_CONTRACT_ID');
+    this.contract = new Contract(this.contractId);
     this.networkPassphrase = NETWORK_PASSPHRASES[network];
     this.platformSigner = Keypair.fromSecret(
       this.config.getOrThrow<string>('PLATFORM_SIGNER_SECRET'),
@@ -113,10 +114,36 @@ export class StellarService {
     this.pollTimeoutSeconds =
       this.config.get<number>('TRANSACTION_POLL_TIMEOUT_SECONDS') ??
       DEFAULT_POLL_TIMEOUT_SECONDS;
+
+    this.logger.log(
+      `StellarService initialized: networkPassphrase='${this.networkPassphrase}', contractId='${this.contractId}'`,
+    );
+  }
+
+  /** Get cached network passphrase (Issue #151). */
+  getNetworkPassphrase(): string {
+    return this.networkPassphrase;
+  }
+
+  /** Get cached contract ID (Issue #151). */
+  getContractId(): string {
+    return this.contractId;
   }
 
   getCircuitBreakerMetrics() {
     return this.rpcCircuitBreaker.metrics();
+  }
+
+  /**
+   * Poll/check status of a transaction by hash (Issue #149).
+   */
+  async getTransactionStatus(txHash: string): Promise<{ status: string; latestLedger?: number; resultXdr?: string }> {
+    const tx = await this.rpcCall(() => this.server.getTransaction(txHash));
+    return {
+      status: tx.status,
+      latestLedger: tx.latestLedger,
+      resultXdr: tx.resultXdr?.toXDR('base64'),
+    };
   }
 
   /** Read-only simulation — no signature, no ledger write, no fee. */
@@ -395,21 +422,35 @@ export class StellarService {
     fn: string,
     args: xdr.ScVal[],
   ): Promise<string> {
-    const account = await this.rpcCall(() =>
-      this.server.getAccount(sourcePublicKey),
-    );
-    const built = new TransactionBuilder(account, {
-      fee: BASE_FEE,
-      networkPassphrase: this.networkPassphrase,
-    })
-      .addOperation(this.contract.call(fn, ...args))
-      .setTimeout(this.buildTxTimeoutSeconds)
-      .build();
+    try {
+      const account = await this.rpcCall(() =>
+        this.server.getAccount(sourcePublicKey),
+      );
+      const built = new TransactionBuilder(account, {
+        fee: BASE_FEE,
+        networkPassphrase: this.networkPassphrase,
+      })
+        .addOperation(this.contract.call(fn, ...args))
+        .setTimeout(this.buildTxTimeoutSeconds)
+        .build();
 
-    const prepared = await this.rpcCall(() =>
-      this.server.prepareTransaction(built),
-    );
-    return prepared.toXDR();
+      // Issue #153: Simulate transaction before returning build payload
+      const sim = await this.rpcCall(() => this.server.simulateTransaction(built));
+      if (rpc.Api.isSimulationError(sim)) {
+        throw mapSorobanErrorToApiException(sim.error);
+      }
+
+      const prepared = await this.rpcCall(() =>
+        this.server.prepareTransaction(built),
+      );
+      return prepared.toXDR();
+    } catch (err) {
+      if (err && typeof err === 'object' && 'getStatus' in err) {
+        throw err;
+      }
+      const msg = err instanceof Error ? err.message : String(err);
+      throw mapSorobanErrorToApiException(msg);
+    }
   }
 
   private async pollTransaction(
